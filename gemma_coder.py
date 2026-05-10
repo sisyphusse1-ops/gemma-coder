@@ -209,25 +209,48 @@ def call_openrouter(messages: list[dict], model: str) -> str:
       OPENROUTER_URL  (default: https://openrouter.ai/api/v1/chat/completions)
       OPENROUTER_API_KEY  (default: empty -- ok for localhost gateways)
     Handles both JSON and streaming (data: ...) responses automatically.
+    Retries 3x on HTTP 5xx or transient errors with exponential backoff.
     """
+    import urllib.error
+    import urllib.request
+
     url = os.environ.get("OPENROUTER_URL", OPENROUTER_URL)
     key = os.environ.get("OPENROUTER_API_KEY", "")
-    import urllib.request
     headers = {"content-type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
         headers["HTTP-Referer"] = "https://github.com/sisyphusse1-ops/gemma-coder"
         headers["X-Title"] = "gemma-coder"
     body = {"model": model, "messages": messages, "temperature": 0.2, "stream": False}
-    req = urllib.request.Request(url, method="POST", headers=headers,
-                                 data=json.dumps(body).encode())
-    with urllib.request.urlopen(req, timeout=120) as r:
-        raw = r.read().decode("utf-8", errors="replace")
+
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(url, method="POST", headers=headers,
+                                         data=json.dumps(body).encode())
+            with urllib.request.urlopen(req, timeout=120) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code >= 500 and attempt < 3:
+                time.sleep(2 ** attempt + 1)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                time.sleep(2 ** attempt + 1)
+                continue
+            raise
+    else:
+        raise last_err or RuntimeError("LLM call failed")
+
     # normal JSON path
     try:
         parsed = json.loads(raw)
         return parsed["choices"][0]["message"]["content"]
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, KeyError):
         pass
     # streaming SSE fallback — concatenate deltas
     parts: list[str] = []
